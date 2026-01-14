@@ -105,8 +105,16 @@ class RecurrentRGCN(nn.Module):
         torch.nn.init.normal_(self.dynamic_emb)
         
 
-        self.weight_t1 = nn.parameter.Parameter(torch.randn(1, h_dim))
-        self.bias_t1 = nn.parameter.Parameter(torch.randn(1, h_dim))
+        # [TempValid Improvement]
+        # Replace linear parameters with decay parameters
+        # decay_beta controls the decay rate (corresponds to beta in TempValid)
+        self.decay_beta = nn.Parameter(torch.Tensor(1, h_dim))
+        nn.init.xavier_uniform_(self.decay_beta)
+        
+        # decay_scale controls the initial confidence (corresponds to confidence c in TempValid)
+        self.decay_scale = nn.Parameter(torch.Tensor(1, h_dim))
+        nn.init.ones_(self.decay_scale)
+        
         self.weight_t2 = nn.parameter.Parameter(torch.randn(1, h_dim))
         self.bias_t2 = nn.parameter.Parameter(torch.randn(1, h_dim))
 
@@ -285,7 +293,16 @@ class RecurrentRGCN(nn.Module):
     def get_init_time(self, quadrupleList):
         T_idx = quadrupleList[:, 3] // self.time_interval
         T_idx = T_idx.unsqueeze(1).float()
-        t1 = self.weight_t1 * T_idx + self.bias_t1
+        
+        # [TempValid Improvement]
+        # Implement Temporal Validity: tv(t) = c * e^(-beta * t)
+        # We use softplus to ensure beta > 0 for valid decay
+        # Note: T_idx might be large, so the model will learn very small betas to avoid vanishing gradients
+        beta = F.softplus(self.decay_beta)
+        T_idx_norm = T_idx / self.num_times # 将时间缩放到 0-1 之间
+        t1 = self.decay_scale * torch.exp(-beta * T_idx_norm)
+        
+        # Keep the periodic encoding from TiRGN as it handles cyclical patterns well
         t2 = self.sin(self.weight_t2 * T_idx + self.bias_t2)
         return t1, t2
 
