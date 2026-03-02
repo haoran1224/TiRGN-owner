@@ -159,7 +159,19 @@ class RecurrentRGCN(nn.Module):
             self.rdecoder_re1 = TimeConvTransR(num_rels, h_dim, input_dropout, hidden_dropout, feat_dropout)
             self.rdecoder_re2 = TimeConvTransR(num_rels, h_dim, input_dropout, hidden_dropout, feat_dropout)
         else:
-            raise NotImplementedError 
+            raise NotImplementedError
+
+        # SRM-LLM Section 4.3: Rule-Based Historical Relation Retrieval Module
+        # =================================================================
+        # 1. 融合权重 \lambda (论文中表示为 \lambda，可学习或固定，论文默认设为0.9)
+        self.lamb = nn.Parameter(torch.tensor(0.9), requires_grad=True)
+
+        # 2. 全局逻辑子图的 R-GCN 聚合器 (对应论文公式5)
+        # 这里复用 TiRGN 已有的 RGCNBlockLayer 或 UnionRGCNLayer
+        self.global_rgcn_layer = RGCNBlockLayer(
+            self.h_dim, self.h_dim, self.num_rels * 2, num_bases,
+            activation=F.rrelu, dropout=dropout, self_loop=True, skip_connect=False
+        )
 
     def forward(self, g_list, static_graph, use_cuda):
         gate_list = []
@@ -202,7 +214,7 @@ class RecurrentRGCN(nn.Module):
         return history_embs, static_emb, self.h_0, gate_list, degree_list
 
 
-    def predict(self, test_graph, num_rels, static_graph, test_triplets, entity_history_vocabulary, rel_history_vocabulary, use_cuda):
+    def predict(self, test_graph, num_rels, static_graph, test_triplets, entity_history_vocabulary, rel_history_vocabulary, global_graph, use_cuda):
         self.use_cuda = use_cuda
         with torch.no_grad():
             inverse_test_triplets = test_triplets[:, [2, 1, 0, 3]]
@@ -210,7 +222,19 @@ class RecurrentRGCN(nn.Module):
             all_triples = torch.cat((test_triplets, inverse_test_triplets))
             
             evolve_embs, _, r_emb, _, _ = self.forward(test_graph, static_graph, use_cuda)
-            embedding = F.normalize(evolve_embs[-1]) if self.layer_norm else evolve_embs[-1]
+            # 提取局部演化表示 E_{t_q}^L
+            local_emb = F.normalize(evolve_embs[-1]) if self.layer_norm else evolve_embs[-1]
+
+            # 计算全局逻辑表示 E_{t_q}^G
+            if use_cuda:
+                global_graph = global_graph.to(self.gpu)
+            global_graph.ndata['h'] = self.dynamic_emb
+            self.global_rgcn_layer(global_graph, [])
+            global_emb = global_graph.ndata.pop('h')
+            global_emb = F.normalize(global_emb) if self.layer_norm else global_emb
+
+            # 融合局部与全局表示
+            embedding = self.lamb * local_emb + (1 - self.lamb) * global_emb
             time_embs = self.get_init_time(all_triples)
 
             score_rel_r = self.rel_raw_mode(embedding, r_emb, time_embs, all_triples)
@@ -226,7 +250,7 @@ class RecurrentRGCN(nn.Module):
             return all_triples, score, score_rel
 
 
-    def get_loss(self, glist, triples, static_graph, entity_history_vocabulary, rel_history_vocabulary, use_cuda):
+    def get_loss(self, glist, triples, static_graph, entity_history_vocabulary, rel_history_vocabulary, global_graph, use_cuda):
         self.use_cuda = use_cuda
         loss_ent = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
         loss_rel = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
@@ -238,7 +262,19 @@ class RecurrentRGCN(nn.Module):
         all_triples = all_triples.to(self.gpu)
 
         evolve_embs, static_emb, r_emb, _, _ = self.forward(glist, static_graph, use_cuda)
-        pre_emb = F.normalize(evolve_embs[-1]) if self.layer_norm else evolve_embs[-1]
+        # 提取局部演化表示 E_{t_q}^L
+        local_emb = F.normalize(evolve_embs[-1]) if self.layer_norm else evolve_embs[-1]
+
+        # 计算全局逻辑表示 E_{t_q}^G
+        if use_cuda:
+            global_graph = global_graph.to(self.gpu)
+        global_graph.ndata['h'] = self.dynamic_emb
+        self.global_rgcn_layer(global_graph, [])
+        global_emb = global_graph.ndata.pop('h')
+        global_emb = F.normalize(global_emb) if self.layer_norm else global_emb
+
+        # 融合局部与全局表示
+        pre_emb = self.lamb * local_emb + (1 - self.lamb) * global_emb
         time_embs = self.get_init_time(all_triples)
 
         if self.entity_prediction:

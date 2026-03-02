@@ -1,3 +1,4 @@
+import os
 
 import numpy as np
 import torch
@@ -406,3 +407,227 @@ def soft_max(z):
     t = np.exp(z)
     a = np.exp(z) / np.sum(t)
     return a
+
+import pickle
+# 1. 辅助函数：根据 Triples 的切分方式，切分 Paths
+def align_paths_with_snapshots(triples_list, flat_paths):
+    """
+    triples_list: TiRGN split_by_time 生成的 train_list (List of numpy arrays)
+    flat_paths: 你加载的那个巨大的 train_paths (List)
+    """
+    path_snapshots = []
+    start_idx = 0
+
+    print("Aligning paths with snapshots...")
+    for snap in triples_list:
+        # 获取当前时间步的样本数量
+        num_samples = len(snap)
+        end_idx = start_idx + num_samples
+
+        # 切片
+        current_paths = flat_paths[start_idx: end_idx]
+        path_snapshots.append(current_paths)
+
+        start_idx = end_idx
+
+    assert start_idx == len(flat_paths) / 2, "Error: Path list length does not match Triples length!"
+    return path_snapshots
+
+
+def process_batch_paths(batch_path_data, num_rels, max_len=3, max_paths=50, use_cuda=True, gpu_id=0):
+    """
+    将 List 格式的路径转换为 Tensor。
+    batch_path_data: 当前时间步及 batch 下的路径列表，长度为 Batch_Size。
+                     每个元素是 [ [s,r,o,t], [s,r,o,t]... ] (即该实体的 Top K 条路径)
+
+    Returns:
+        path_rels: (Batch, TopK, Max_Len) - 存储关系 ID
+        path_times: (Batch, TopK, Max_Len) - 存储时间 (或 mask)
+    """
+    if batch_path_data is None:
+        return None, None
+
+    batch_size = len(batch_path_data)
+
+    # 初始化 Tensor (全部填充为 0 或特定的 Padding ID)
+    # 假设 0 是 padding id (通常关系ID从0开始，建议用 num_rels 或 -1 做 padding，这里为了简单用 num_rels)
+    padding_val = num_rels*2
+
+    # path_rels: 存储路径上的关系
+    path_rels = torch.full((batch_size, max_paths, max_len), padding_val, dtype=torch.long)
+    # path_times: 存储路径上的时间 (用于计算衰减)
+    path_times = torch.zeros((batch_size, max_paths), dtype=torch.float)
+    # 注意：CRAFT 的 Attention 只需要路径的最早时间 (t_ear) 或者每一步的时间？
+    # 根据之前的 CRAFT 逻辑，我们需要 Top-K 路径的 "最早发生时间" 或 "每一步时间"。
+    # 假设你的数据里 [s,r,o,t] 的 t 是这一步的时间。
+    # 这里我们只取每条路径的第一步时间作为 t_ear (用于时间衰减)。
+    path_masks = torch.zeros((batch_size, max_paths), dtype=torch.float)
+
+    for i, paths_list in enumerate(batch_path_data):
+        # paths_list 是当前样本的所有历史路径 (最多50条)
+        # 截断或填充到 max_paths
+        curr_paths = paths_list[:max_paths]
+
+        for j, path in enumerate(curr_paths):
+            # path 是一个列表: [[s1, r1, o1, t1], [s2, r2, o2, t2], ...]
+            # 1. 提取时间 (取路径第一跳的时间作为 t_ear)
+            if len(path) > 0:
+                path_times[i, j] = float(path[0][3])
+                path_masks[i, j] = 1.0
+
+            # 2. 提取关系链并填充到 max_len
+            for k, quad in enumerate(path):
+                if k >= max_len: break
+                # quad: [s, r, o, t] -> 取 r (索引1)
+                r_id = quad[1]
+                path_rels[i, j, k] = r_id
+
+    if use_cuda:
+        device = torch.device(gpu_id)
+        path_rels = path_rels.to(device)
+        path_times = path_times.to(device)
+        path_masks = path_masks.to(device)
+
+    return path_rels, path_times, path_masks
+
+
+def align_data_to_path(path_file_path, data_list):
+    if os.path.exists(path_file_path):
+        print(f"Loading paths from {path_file_path}...")
+        with open(path_file_path, "rb") as f:
+            train_paths_flat = pickle.load(f)
+
+        # 核心步骤：切分路径数据以对齐 train_list
+        train_path_snaps = align_paths_with_snapshots(data_list, train_paths_flat)
+        print(f"Paths aligned. Total snapshots: {len(train_path_snaps)}")
+    else:
+        print("Warning: Path file not found!")
+        train_path_snaps = [None] * len(data_list)
+
+    return train_path_snaps
+
+
+import pickle
+import dgl
+import torch
+
+
+def build_global_graph_from_paths(batch_paths, num_ents, num_rels=None, add_inverse=True, use_cuda=False):
+    """
+    将 TLogic 检索到的当前 batch 的历史路径转换为 DGL 全局子图。
+
+    参数:
+    batch_paths (list): 当前 batch 对应的路径列表。
+                        格式: [[path1, path2], [], [path3], ...]
+                        其中 path = [[s, r, o, t], ...]
+    num_ents (int):     知识图谱中的实体总数。
+    num_rels (int):     知识图谱中的关系总数（仅在 add_inverse=True 时需要）。
+    add_inverse (bool): 是否为每条边添加反向关系边 (o, r + num_rels, s)。
+                        TiRGN 的 R-GCN 层通常期望输入包含反向边的双向图。
+    use_cuda (bool):    是否将图放到 GPU 上。
+
+    返回:
+    g (dgl.DGLGraph):   构建好的全局子图。
+    """
+    src_list = []
+    rel_list = []
+    dst_list = []
+
+    # 使用 set 去重，避免同一个事实 (s, r, o) 在图中出现多次导致权重翻倍
+    unique_edges = set()
+
+    # 1. 解析 batch 内的所有路径
+    for query_paths in batch_paths:
+        if not query_paths:  # 如果该 query 列表为空（没有检索到历史路径）
+            continue
+
+        for path in query_paths:
+            for edge in path:
+                # 解析单条边 [s, r, o, t]
+                s, r, o, t = edge
+                unique_edges.add((s, r, o))
+
+                # 如果 TiRGN 的 RGCN 层(num_rels * 2)需要反向边，在此处统一添加
+                if add_inverse and num_rels is not None:
+                    unique_edges.add((o, r + num_rels, s))
+
+    # 2. 处理 batch 内完全没有历史路径的极端情况
+    if len(unique_edges) == 0:
+        # 构造一个无边的空图，避免 DGL 在前向传播时报错
+        g = dgl.graph(([], []), num_nodes=num_ents)
+        g.edata['type'] = torch.tensor([], dtype=torch.long)
+        g.ndata['norm'] = torch.ones(num_ents, 1)
+        if use_cuda:
+            g = g.to('cuda')
+        return g
+
+    # 3. 将去重后的边解包
+    for s, r, o in unique_edges:
+        src_list.append(s)
+        rel_list.append(r)
+        dst_list.append(o)
+
+    # 转换为 Tensor
+    src_tensor = torch.tensor(src_list, dtype=torch.long)
+    dst_tensor = torch.tensor(dst_list, dtype=torch.long)
+    rel_tensor = torch.tensor(rel_list, dtype=torch.long)
+
+    # 4. 构建 DGL 图
+    g = dgl.graph((src_tensor, dst_tensor), num_nodes=num_ents)
+    g.edata['type'] = rel_tensor
+
+    # 5. 计算 R-GCN 需要的归一化常数 (norm = 1 / in_degree)
+    # clamp(min=1) 防止孤立节点的入度为 0 导致除零错误
+    in_deg = g.in_degrees().float().clamp(min=1)
+    norm = 1.0 / in_deg
+    g.ndata['norm'] = norm.unsqueeze(1)  # shape: (num_ents, 1)
+
+    if use_cuda:
+        g = g.to('cuda')
+
+    return g
+
+
+# ==========================================
+# 测试与使用示例 (Dummy Example)
+# ==========================================
+if __name__ == "__main__":
+    # 假设你已经通过 TLogic 生成了 train_paths_top50.pkl
+    # 模拟读取 pickle 文件的过程
+    """
+    with open('train_paths_top50.pkl', 'rb') as f:
+        all_train_paths = pickle.load(f)
+    """
+
+    # 模拟 all_train_paths 中的一个 Batch (假设 batch_size = 3)
+    # 路径格式: [s, r, o, t]
+    mock_batch_paths = [
+        # Query 0 检索到的两条路径
+        [
+            [[10, 1, 20, 100], [20, 2, 30, 101]],
+            [[10, 3, 30, 100]]
+        ],
+        # Query 1 没有检索到任何路径
+        [],
+        # Query 2 检索到的一条路径 (注意里面有一条边与 Query 0 重复了)
+        [
+            [[40, 4, 50, 102], [10, 1, 20, 100]]
+        ]
+    ]
+
+    num_entities = 100  # 假设数据集中有 100 个实体
+    num_relations = 10  # 假设数据集中有 10 个正向关系
+
+    # 生成 DGL Global Graph
+    global_g = build_global_graph_from_paths(
+        batch_paths=mock_batch_paths,
+        num_ents=num_entities,
+        num_rels=num_relations,
+        add_inverse=True,  # 为 TiRGN 添加反向边
+        use_cuda=False
+    )
+
+    print(f"全局子图节点数: {global_g.num_nodes()}")
+    print(f"全局子图边数 (包含反向边): {global_g.num_edges()}")
+    print(f"节点归一化常数 Shape: {global_g.ndata['norm'].shape}")
+    print(f"边类型 Shape: {global_g.edata['type'].shape}")

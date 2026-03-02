@@ -18,9 +18,64 @@ import torch.nn.modules.rnn
 from collections import defaultdict
 from rgcn.knowledge_graph import _read_triplets_as_list
 import scipy.sparse as sp
+import pickle
+import dgl
+import torch
 
 
-def test(model, history_list, test_list, num_rels, num_nodes, use_cuda, all_ans_list, all_ans_r_list, model_name, static_graph, time_list, history_time_nogt, mode):
+# =================================================================
+# SRM-LLM Module: Global Graph Builder & Path Aligner (修复版)
+# =================================================================
+def build_global_graph_from_paths(batch_paths, num_ents, num_rels, add_inverse=True, use_cuda=False):
+    """从当前 Batch (Snapshot) 的路径列表中构建 DGL 全局逻辑子图"""
+    unique_edges = set()
+    for query_paths in batch_paths:
+        if not query_paths: continue
+        for path in query_paths:
+            for edge in path:
+                s, r, o, t = edge
+                unique_edges.add((s, r, o))
+                if add_inverse:
+                    # 【核心修复】安全地计算反向关系 ID
+                    # 如果 r 已经是反向关系 (>= num_rels)，它的反向(即原正向)为 r - num_rels
+                    # 如果 r 是正向关系 (< num_rels)，它的反向为 r + num_rels
+                    r_inv = r - num_rels if r >= num_rels else r + num_rels
+                    unique_edges.add((o, r_inv, s))
+
+    if len(unique_edges) == 0:
+        g = dgl.graph(([], []), num_nodes=num_ents)
+        g.edata['type'] = torch.tensor([], dtype=torch.long)
+        g.ndata['norm'] = torch.ones(num_ents, 1)
+    else:
+        src_list, rel_list, dst_list = zip(*unique_edges)
+        src_tensor = torch.tensor(src_list, dtype=torch.long)
+        dst_tensor = torch.tensor(dst_list, dtype=torch.long)
+        rel_tensor = torch.tensor(rel_list, dtype=torch.long)
+
+        g = dgl.graph((src_tensor, dst_tensor), num_nodes=num_ents)
+        g.edata['type'] = rel_tensor
+        in_deg = g.in_degrees().float().clamp(min=1)
+        g.ndata['norm'] = (1.0 / in_deg).unsqueeze(1)
+
+    if use_cuda:
+        g = g.to('cuda')
+    return g
+
+
+def align_paths_to_snapshots(data_list, all_paths):
+    """按 snapshot 长度将平铺的 TLogic 路径切割对齐"""
+    aligned = []
+    ptr = 0
+    for snap in data_list:
+        length = len(snap)
+        aligned.append(all_paths[ptr: ptr + length])
+        ptr += length
+    return aligned
+
+
+# =================================================================
+
+def test(model, history_list, test_list, num_rels, num_nodes, use_cuda, all_ans_list, all_ans_r_list, model_name, static_graph, time_list, history_time_nogt, mode, test_snapshot_paths):
     ranks_raw, ranks_filter, mrr_raw_list, mrr_filter_list = [], [], [], []
     ranks_raw_r, ranks_filter_r, mrr_raw_list_r, mrr_filter_list_r = [], [], [], []
 
@@ -81,7 +136,13 @@ def test(model, history_list, test_list, num_rels, num_nodes, use_cuda, all_ans_
             one_hot_tail_seq = one_hot_tail_seq.cuda()
             one_hot_rel_seq = one_hot_rel_seq.cuda()
 
-        test_triples, final_score, final_r_score = model.predict(history_glist, num_rels, static_graph, test_triples_input, one_hot_tail_seq, one_hot_rel_seq, use_cuda)
+        # ==================== SRM-LLM ADD ====================
+        current_batch_paths = test_snapshot_paths[time_idx]
+        global_graph = build_global_graph_from_paths(
+            current_batch_paths, num_nodes, num_rels, add_inverse=True, use_cuda=use_cuda)
+        # =====================================================
+
+        test_triples, final_score, final_r_score = model.predict(history_glist, num_rels, static_graph, test_triples_input, one_hot_tail_seq, one_hot_rel_seq, global_graph, use_cuda)
 
         mrr_filter_snap_r, mrr_snap_r, rank_raw_r, rank_filter_r = utils.get_total_rank(test_triples, final_r_score, all_ans_r_list[time_idx], eval_bz=1000, rel_predict=1)
         mrr_filter_snap, mrr_snap, rank_raw, rank_filter = utils.get_total_rank(test_triples, final_score, all_ans_list[time_idx], eval_bz=1000, rel_predict=0)
@@ -170,6 +231,23 @@ def run_experiment(args, history_len=None, n_layers=None, dropout=None, n_bases=
     all_ans_list_valid = utils.load_all_answers_for_time_filter(data.valid, num_rels, num_nodes, False)
     all_ans_list_r_valid = utils.load_all_answers_for_time_filter(data.valid, num_rels, num_nodes, True)
 
+    # ==================== SRM-LLM ADD ====================
+    print("loading TLogic history paths...")
+    # 请确保路径文件放在 data/对应数据集/ 下，或根据你的实际存放位置修改路径
+    with open(f'../data/{args.dataset}/train_paths_top50.pkl', 'rb') as f:
+        all_train_paths = pickle.load(f)
+    with open(f'../data/{args.dataset}/valid_paths_top50.pkl', 'rb') as f:
+        all_valid_paths = pickle.load(f)
+    with open(f'../data/{args.dataset}/test_paths_top50.pkl', 'rb') as f:
+        all_test_paths = pickle.load(f)
+
+    # 对齐数据：将平铺列表按 snapshot 长度切片
+    train_snapshot_paths = align_paths_to_snapshots(train_list, all_train_paths)
+    valid_snapshot_paths = align_paths_to_snapshots(valid_list, all_valid_paths)
+    test_snapshot_paths = align_paths_to_snapshots(test_list, all_test_paths)
+    print("TLogic history paths loaded and aligned to snapshots.")
+    # =====================================================
+
     model_name = "gl_rate_{}-{}-{}-{}-ly{}-dilate{}-his{}-weight_{}-discount_{}-angle_{}-dp{}_{}_{}_{}-gpu{}-{}"\
         .format(args.history_rate, args.dataset, args.encoder, args.decoder, args.n_layers, args.dilate_len, args.train_history_len, args.weight, args.discount, args.angle,
                 args.dropout, args.input_dropout, args.hidden_dropout, args.feat_dropout, args.gpu, args.save)
@@ -247,7 +325,8 @@ def run_experiment(args, history_len=None, n_layers=None, dropout=None, n_bases=
                                                             static_graph,
                                                             test_times,
                                                             history_test_time_nogt,
-                                                            "test")
+                                                            "test",
+                                                            test_snapshot_paths)
     elif args.test and not os.path.exists(model_state_file):
         print("--------------{} not exist, Change mode to train and generate stat for testing----------------\n".format(model_state_file))
     else:
@@ -297,7 +376,14 @@ def run_experiment(args, history_len=None, n_layers=None, dropout=None, n_bases=
                     one_hot_tail_seq = one_hot_tail_seq.cuda()
                     one_hot_rel_seq = one_hot_rel_seq.cuda()
 
-                loss_e, loss_r, loss_static = model.get_loss(history_glist, output[0], static_graph, one_hot_tail_seq, one_hot_rel_seq, use_cuda)
+                # ==================== SRM-LLM ADD ====================
+                # 取出当前 batch 的对齐后路径并构图
+                current_batch_paths = train_snapshot_paths[train_sample_num]
+                global_graph = build_global_graph_from_paths(
+                    current_batch_paths, num_nodes, num_rels, add_inverse=True, use_cuda=use_cuda)
+                # =====================================================
+
+                loss_e, loss_r, loss_static = model.get_loss(history_glist, output[0], static_graph, one_hot_tail_seq, one_hot_rel_seq, global_graph, use_cuda)
                 loss = args.task_weight*loss_e + (1-args.task_weight)*loss_r + loss_static
 
                 losses.append(loss.item())
@@ -327,7 +413,8 @@ def run_experiment(args, history_len=None, n_layers=None, dropout=None, n_bases=
                                                                     static_graph,
                                                                     valid_times,
                                                                     history_val_time_nogt,
-                                                                    mode="train")
+                                                                    mode="train",
+                                                                    test_snapshot_paths=valid_snapshot_paths)
                 
                 if not args.relation_evaluation:  # entity prediction evalution
                     if mrr_raw < best_mrr:
@@ -355,7 +442,8 @@ def run_experiment(args, history_len=None, n_layers=None, dropout=None, n_bases=
                                                             static_graph,
                                                             test_times,
                                                             history_test_time_nogt,
-                                                            mode="test")
+                                                            mode="test",
+                                                            test_snapshot_paths=test_snapshot_paths)
     return mrr_raw, mrr_filter, mrr_raw_r, mrr_filter_r, hit_result_raw, hit_result_filter, hit_result_raw_r, hit_result_filter_r
 
 
