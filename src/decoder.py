@@ -36,16 +36,20 @@ class TimeConvTransR(torch.nn.Module):
         emb_time_2 = emb_time_2.unsqueeze(1)
 
         stacked_inputs = torch.cat([e1_embedded, e2_embedded, emb_time_1, emb_time_2], 1)
-        stacked_inputs = self.bn0(stacked_inputs)
+        # 关键修复：batch_size=1 时跳过 BatchNorm，避免产生 nan
+        if batch_size > 1:
+            stacked_inputs = self.bn0(stacked_inputs)
         x = self.inp_drop(stacked_inputs)
         x = self.conv1(x)
-        x = self.bn1(x)
+        if batch_size > 1:
+            x = self.bn1(x)
         x = F.relu(x)
         x = self.feature_map_drop(x)
         x = x.view(batch_size, -1)
         x = self.fc(x)
         x = self.hidden_drop(x)
-        x = self.bn2(x)
+        if batch_size > 1:
+            x = self.bn2(x)
         x = F.relu(x)
         if partial_embeding is None:
             x = torch.mm(x, emb_rel.transpose(1, 0))
@@ -83,10 +87,13 @@ class TimeConvTransE(torch.nn.Module):
         emb_time_2 = emb_time_2.unsqueeze(1)
 
         stacked_inputs = torch.cat([e1_embedded, rel_embedded, emb_time_1, emb_time_2], 1)  # batch_size,2,h_dim
-        stacked_inputs = self.bn0(stacked_inputs)  # batch_size,2,h_dim
+        # 关键修复：batch_size=1 时跳过 BatchNorm，避免产生 nan
+        if batch_size > 1:
+            stacked_inputs = self.bn0(stacked_inputs)  # batch_size,2,h_dim
         x = self.inp_drop(stacked_inputs)  # batch_size,2,h_dim
         x = self.conv1(x)  # batch_size,2,h_dim
-        x = self.bn1(x)  # batch_size,channels,h_dim
+        if batch_size > 1:
+            x = self.bn1(x)  # batch_size,channels,h_dim
         x = F.relu(x)
         x = self.feature_map_drop(x)
         x = x.view(batch_size, -1)  # batch_size,channels*h_dim

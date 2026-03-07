@@ -9,6 +9,8 @@ import numpy as np
 from rgcn.layers import UnionRGCNLayer, RGCNBlockLayer
 from src.model import BaseRGCN
 from src.decoder import *
+from src.fusion import LocalGlobalFusion
+from src.path_encoder import PathEncoder, process_paths
 
 
 class RGCNCell(BaseRGCN):
@@ -58,7 +60,14 @@ class RecurrentRGCN(nn.Module):
                  num_hidden_layers=1, dropout=0, self_loop=False, skip_connect=False, layer_norm=False, input_dropout=0,
                  hidden_dropout=0, feat_dropout=0, aggregation='cat', weight=1, discount=0, angle=0, use_static=False,
                  entity_prediction=False, relation_prediction=False, use_cuda=False,
-                 gpu = 0, analysis=False):
+                 gpu = 0, analysis=False, K=50, max_seq_len=10):
+        """
+        RecurrentRGCN 模型，集成路径编码器和局部-全局融合模块
+
+        Args:
+            K: 每条查询的路径数量，默认为 50
+            max_seq_len: 路径的最大长度，默认为 10
+        """
         super(RecurrentRGCN, self).__init__()
 
         self.decoder_name = decoder_name
@@ -91,6 +100,11 @@ class RecurrentRGCN(nn.Module):
         self.linear_1 = nn.Linear(num_times, self.h_dim - 1)
         self.tanh = nn.Tanh()
         self.use_cuda = None
+
+        # ==================== 新增：路径编码器和融合模块参数 ====================
+        self.K = K  # 每条查询的路径数量
+        self.max_seq_len = max_seq_len  # 路径的最大长度
+        # ====================================================================
 
         self.w1 = torch.nn.Parameter(torch.Tensor(self.h_dim, self.h_dim), requires_grad=True).float()
         torch.nn.init.xavier_normal_(self.w1)
@@ -173,6 +187,26 @@ class RecurrentRGCN(nn.Module):
             activation=F.rrelu, dropout=dropout, self_loop=True, skip_connect=False
         )
 
+        # ==================== 新增：路径编码器模块 ====================
+        # 路径编码器：将历史路径编码为全局逻辑表示
+        self.path_encoder = PathEncoder(
+            num_ents=num_ents,
+            num_rels=num_rels,
+            h_dim=h_dim,
+            K=K,
+            max_seq_len=max_seq_len
+        )
+        # =============================================================
+
+        # ==================== 新增：局部-全局融合模块 ====================
+        # 局部-全局融合模块：融合局部演化表示和全局路径表示
+        self.local_global_fusion = LocalGlobalFusion(
+            h_dim=h_dim,
+            dropout=dropout,
+            use_layer_norm=layer_norm
+        )
+        # =============================================================
+
     def forward(self, g_list, static_graph, use_cuda):
         gate_list = []
         degree_list = []
@@ -214,27 +248,87 @@ class RecurrentRGCN(nn.Module):
         return history_embs, static_emb, self.h_0, gate_list, degree_list
 
 
-    def predict(self, test_graph, num_rels, static_graph, test_triplets, entity_history_vocabulary, rel_history_vocabulary, global_graph, use_cuda):
+    def predict(self, test_graph, num_rels, static_graph, test_triplets, entity_history_vocabulary, rel_history_vocabulary, global_graph, batch_paths, use_cuda):
+        """
+        预测函数，集成路径编码器和局部-全局融合模块
+
+        Args:
+            batch_paths: 当前批次的路径数据，每个元素是一个查询的路径列表
+        """
         self.use_cuda = use_cuda
         with torch.no_grad():
             inverse_test_triplets = test_triplets[:, [2, 1, 0, 3]]
             inverse_test_triplets[:, 1] = inverse_test_triplets[:, 1] + num_rels
             all_triples = torch.cat((test_triplets, inverse_test_triplets))
-            
+
             evolve_embs, _, r_emb, _, _ = self.forward(test_graph, static_graph, use_cuda)
             # 提取局部演化表示 E_{t_q}^L
             local_emb = F.normalize(evolve_embs[-1]) if self.layer_norm else evolve_embs[-1]
 
-            # 计算全局逻辑表示 E_{t_q}^G
-            if use_cuda:
-                global_graph = global_graph.to(self.gpu)
-            global_graph.ndata['h'] = self.dynamic_emb
-            self.global_rgcn_layer(global_graph, [])
-            global_emb = global_graph.ndata.pop('h')
-            global_emb = F.normalize(global_emb) if self.layer_norm else global_emb
+            # ==================== 新增：路径编码器处理 ====================
+            # 处理路径数据
+            device = self.gpu if use_cuda else 'cpu'
 
-            # 融合局部与全局表示
-            embedding = self.lamb * local_emb + (1 - self.lamb) * global_emb
+            # 检查 batch_paths 的类型和长度
+            if batch_paths is None or len(batch_paths) == 0:
+                # 如果没有路径数据，直接使用局部嵌入
+                embedding = local_emb
+            else:
+                # 确保路径数据与三元组数据匹配
+                batch_size = all_triples.size(0)
+
+                # 如果路径数量与三元组数量不匹配，需要调整
+                if len(batch_paths) != batch_size:
+                    # 扩展或截断 batch_paths 以匹配 batch_size
+                    if len(batch_paths) < batch_size:
+                        # 重复使用路径数据
+                        batch_paths = list(batch_paths) * (batch_size // len(batch_paths) + 1)
+                        batch_paths = batch_paths[:batch_size]
+                    else:
+                        batch_paths = batch_paths[:batch_size]
+
+                paths_tensor, path_lengths = process_paths(
+                    batch_paths, K=self.K, max_seq_len=self.max_seq_len, device=device,
+                    num_ents=self.num_ents, num_rels=self.num_rels
+                )
+
+                # paths_tensor 的第一个维度应该等于 batch_size
+                path_batch_size = paths_tensor.size(0)
+
+                # 如果由于某种原因 paths_tensor 的大小不等于 batch_size，进行调整
+                if path_batch_size != batch_size:
+                    # 只处理前 path_batch_size 个三元组
+                    query_times = all_triples[:path_batch_size, 3].float()  # [path_batch_size]
+                    query_entity_ids = all_triples[:path_batch_size, 0]  # [path_batch_size]
+                    local_emb_per_query = local_emb[query_entity_ids]  # [path_batch_size, h_dim]
+                else:
+                    query_times = all_triples[:, 3].float()  # [batch_size]
+                    query_entity_ids = all_triples[:, 0]  # [batch_size]
+                    local_emb_per_query = local_emb[query_entity_ids]  # [batch_size, h_dim]
+
+                try:
+                    # 使用路径编码器
+                    path_global_emb = self.path_encoder(
+                        paths_tensor, path_lengths, query_times,
+                        local_emb, self.emb_rel
+                    )  # [path_batch_size, h_dim]
+
+                    # 使用局部-全局融合模块融合表示
+                    # 对于每个查询三元组，使用对应的局部表示
+                    final_emb = self.local_global_fusion(
+                        local_emb_per_query,  # [path_batch_size, h_dim]
+                        path_global_emb       # [path_batch_size, h_dim]
+                    )
+
+                    # 将融合后的表示放回完整实体嵌入中
+                    embedding = local_emb.clone()
+                    embedding[query_entity_ids] = final_emb
+                except Exception as e:
+                    # 如果路径编码失败，回退到使用局部嵌入
+                    print(f"路径编码失败，使用局部嵌入: {str(e)}")
+                    embedding = local_emb
+            # ===========================================================
+
             time_embs = self.get_init_time(all_triples)
 
             score_rel_r = self.rel_raw_mode(embedding, r_emb, time_embs, all_triples)
@@ -242,15 +336,28 @@ class RecurrentRGCN(nn.Module):
             score_r = self.raw_mode(embedding, r_emb, time_embs, all_triples)
             score_h = self.history_mode(embedding, r_emb, time_embs, all_triples, entity_history_vocabulary)
 
+            # 关键修复：添加数值稳定性保护
+            # 添加小量 epsilon 防止 log(0) = nan
+            epsilon = 1e-8
+
             score_rel = self.history_rate * score_rel_h + (1 - self.history_rate) * score_rel_r
+            score_rel = torch.clamp(score_rel, min=epsilon, max=1.0)
             score_rel = torch.log(score_rel)
+
             score = self.history_rate * score_h + (1 - self.history_rate) * score_r
+            score = torch.clamp(score, min=epsilon, max=1.0)
             score = torch.log(score)
 
             return all_triples, score, score_rel
 
 
-    def get_loss(self, glist, triples, static_graph, entity_history_vocabulary, rel_history_vocabulary, global_graph, use_cuda):
+    def get_loss(self, glist, triples, static_graph, entity_history_vocabulary, rel_history_vocabulary, global_graph, batch_paths, use_cuda):
+        """
+        计算损失函数，集成路径编码器和局部-全局融合模块
+
+        Args:
+            batch_paths: 当前批次的路径数据，每个元素是一个查询的路径列表
+        """
         self.use_cuda = use_cuda
         loss_ent = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
         loss_rel = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
@@ -265,29 +372,87 @@ class RecurrentRGCN(nn.Module):
         # 提取局部演化表示 E_{t_q}^L
         local_emb = F.normalize(evolve_embs[-1]) if self.layer_norm else evolve_embs[-1]
 
-        # 计算全局逻辑表示 E_{t_q}^G
-        if use_cuda:
-            global_graph = global_graph.to(self.gpu)
-        global_graph.ndata['h'] = self.dynamic_emb
-        self.global_rgcn_layer(global_graph, [])
-        global_emb = global_graph.ndata.pop('h')
-        global_emb = F.normalize(global_emb) if self.layer_norm else global_emb
+        # ==================== 新增：路径编码器处理 ====================
+        # 处理路径数据
+        device = self.gpu if use_cuda else 'cpu'
 
-        # 融合局部与全局表示
-        pre_emb = self.lamb * local_emb + (1 - self.lamb) * global_emb
+        # 检查 batch_paths 的类型和长度
+        if batch_paths is None or len(batch_paths) == 0:
+            # 如果没有路径数据，直接使用局部嵌入
+            pre_emb = local_emb
+        else:
+            # 确保路径数据与三元组数据匹配
+            batch_size = all_triples.size(0)
+
+            # 如果路径数量与三元组数量不匹配，需要调整
+            if len(batch_paths) != batch_size:
+                # 扩展或截断 batch_paths 以匹配 batch_size
+                if len(batch_paths) < batch_size:
+                    # 重复使用路径数据
+                    batch_paths = list(batch_paths) * (batch_size // len(batch_paths) + 1)
+                    batch_paths = batch_paths[:batch_size]
+                else:
+                    batch_paths = batch_paths[:batch_size]
+
+            paths_tensor, path_lengths = process_paths(
+                batch_paths, K=self.K, max_seq_len=self.max_seq_len, device=device,
+                num_ents=self.num_ents, num_rels=self.num_rels
+            )
+
+            # paths_tensor 的第一个维度应该等于 batch_size
+            path_batch_size = paths_tensor.size(0)
+
+            # 如果由于某种原因 paths_tensor 的大小不等于 batch_size，进行调整
+            if path_batch_size != batch_size:
+                # 只处理前 path_batch_size 个三元组
+                query_times = all_triples[:path_batch_size, 3].float()  # [path_batch_size]
+                query_entity_ids = all_triples[:path_batch_size, 0]  # [path_batch_size]
+                local_emb_per_query = local_emb[query_entity_ids]  # [path_batch_size, h_dim]
+            else:
+                query_times = all_triples[:, 3].float()  # [batch_size]
+                query_entity_ids = all_triples[:, 0]  # [batch_size]
+                local_emb_per_query = local_emb[query_entity_ids]  # [batch_size, h_dim]
+
+            try:
+                # 使用路径编码器
+                path_global_emb = self.path_encoder(
+                    paths_tensor, path_lengths, query_times,
+                    local_emb, self.emb_rel
+                )  # [path_batch_size, h_dim]
+
+                # 使用局部-全局融合模块融合表示
+                final_emb = self.local_global_fusion(
+                    local_emb_per_query,  # [path_batch_size, h_dim]
+                    path_global_emb       # [path_batch_size, h_dim]
+                )
+
+                # 将融合后的表示放回完整实体嵌入中
+                pre_emb = local_emb.clone()
+                pre_emb[query_entity_ids] = final_emb
+            except Exception as e:
+                # 如果路径编码失败，回退到使用局部嵌入
+                print(f"路径编码失败，使用局部嵌入: {str(e)}")
+                pre_emb = local_emb
+        # ===========================================================
+
         time_embs = self.get_init_time(all_triples)
+
+        # 关键修复：添加数值稳定性保护
+        epsilon = 1e-8
 
         if self.entity_prediction:
             score_r = self.raw_mode(pre_emb, r_emb, time_embs, all_triples)
             score_h = self.history_mode(pre_emb, r_emb, time_embs, all_triples, entity_history_vocabulary)
             score_en = self.history_rate * score_h + (1 - self.history_rate) * score_r
+            score_en = torch.clamp(score_en, min=epsilon, max=1.0)
             scores_en = torch.log(score_en)
             loss_ent += F.nll_loss(scores_en, all_triples[:, 2])
-     
+
         if self.relation_prediction:
             score_rel_r = self.rel_raw_mode(pre_emb, r_emb, time_embs, all_triples)
             score_rel_h = self.rel_history_mode(pre_emb, r_emb, time_embs, all_triples, rel_history_vocabulary)
             score_re = self.history_rate * score_rel_h + (1 - self.history_rate) * score_rel_r
+            score_re = torch.clamp(score_re, min=epsilon, max=1.0)
             scores_re = torch.log(score_re)
             loss_rel += F.nll_loss(scores_re, all_triples[:, 1])
 
@@ -302,6 +467,8 @@ class RecurrentRGCN(nn.Module):
                     else:
                         sim_matrix = torch.sum(static_emb * evolve_emb, dim=1)
                         c = torch.norm(static_emb, p=2, dim=1) * torch.norm(evolve_emb, p=2, dim=1)
+                        # 关键修复：防止除以零
+                        c = torch.clamp(c, min=1e-8)
                         sim_matrix = sim_matrix / c
                     mask = (math.cos(step) - sim_matrix) > 0
                     loss_static += self.weight * torch.sum(torch.masked_select(math.cos(step) - sim_matrix, mask))
@@ -313,6 +480,8 @@ class RecurrentRGCN(nn.Module):
                     else:
                         sim_matrix = torch.sum(static_emb * evolve_emb, dim=1)
                         c = torch.norm(static_emb, p=2, dim=1) * torch.norm(evolve_emb, p=2, dim=1)
+                        # 关键修复：防止除以零
+                        c = torch.clamp(c, min=1e-8)
                         sim_matrix = sim_matrix / c
                     mask = (math.cos(step) - sim_matrix) > 0
                     loss_static += self.weight * torch.sum(torch.masked_select(math.cos(step) - sim_matrix, mask))

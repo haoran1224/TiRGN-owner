@@ -5,7 +5,7 @@
       <paths name="lhr@125.223.116.139:10000 password">
         <serverdata>
           <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/TiRGN-main" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>

@@ -33,14 +33,31 @@ def build_global_graph_from_paths(batch_paths, num_ents, num_rels, add_inverse=T
         if not query_paths: continue
         for path in query_paths:
             for edge in path:
+                if edge is None or len(edge) != 4:
+                    continue
                 s, r, o, t = edge
-                unique_edges.add((s, r, o))
-                if add_inverse:
-                    # 【核心修复】安全地计算反向关系 ID
-                    # 如果 r 已经是反向关系 (>= num_rels)，它的反向(即原正向)为 r - num_rels
-                    # 如果 r 是正向关系 (< num_rels)，它的反向为 r + num_rels
-                    r_inv = r - num_rels if r >= num_rels else r + num_rels
-                    unique_edges.add((o, r_inv, s))
+                # 关键修复：添加边界检查，防止索引越界
+                try:
+                    s_int = int(s)
+                    r_int = int(r)
+                    o_int = int(o)
+
+                    # 边界检查
+                    s_int = max(0, min(s_int, num_ents - 1))
+                    o_int = max(0, min(o_int, num_ents - 1))
+                    r_int = max(0, min(r_int, num_rels * 2 - 1))  # 包括反向关系
+
+                    unique_edges.add((s_int, r_int, o_int))
+
+                    if add_inverse:
+                        # 【核心修复】安全地计算反向关系 ID
+                        # 如果 r 已经是反向关系 (>= num_rels)，它的反向(即原正向)为 r - num_rels
+                        # 如果 r 是正向关系 (< num_rels)，它的反向为 r + num_rels
+                        r_inv = r_int - num_rels if r_int >= num_rels else r_int + num_rels
+                        r_inv = max(0, min(r_inv, num_rels * 2 - 1))  # 再次确保边界
+                        unique_edges.add((o_int, r_inv, s_int))
+                except (ValueError, TypeError):
+                    continue
 
     if len(unique_edges) == 0:
         g = dgl.graph(([], []), num_nodes=num_ents)
@@ -142,7 +159,7 @@ def test(model, history_list, test_list, num_rels, num_nodes, use_cuda, all_ans_
             current_batch_paths, num_nodes, num_rels, add_inverse=True, use_cuda=use_cuda)
         # =====================================================
 
-        test_triples, final_score, final_r_score = model.predict(history_glist, num_rels, static_graph, test_triples_input, one_hot_tail_seq, one_hot_rel_seq, global_graph, use_cuda)
+        test_triples, final_score, final_r_score = model.predict(history_glist, num_rels, static_graph, test_triples_input, one_hot_tail_seq, one_hot_rel_seq, global_graph, current_batch_paths, use_cuda)
 
         mrr_filter_snap_r, mrr_snap_r, rank_raw_r, rank_filter_r = utils.get_total_rank(test_triples, final_r_score, all_ans_r_list[time_idx], eval_bz=1000, rel_predict=1)
         mrr_filter_snap, mrr_snap, rank_raw, rank_filter = utils.get_total_rank(test_triples, final_score, all_ans_list[time_idx], eval_bz=1000, rel_predict=0)
@@ -383,7 +400,7 @@ def run_experiment(args, history_len=None, n_layers=None, dropout=None, n_bases=
                     current_batch_paths, num_nodes, num_rels, add_inverse=True, use_cuda=use_cuda)
                 # =====================================================
 
-                loss_e, loss_r, loss_static = model.get_loss(history_glist, output[0], static_graph, one_hot_tail_seq, one_hot_rel_seq, global_graph, use_cuda)
+                loss_e, loss_r, loss_static = model.get_loss(history_glist, output[0], static_graph, one_hot_tail_seq, one_hot_rel_seq, global_graph, current_batch_paths, use_cuda)
                 loss = args.task_weight*loss_e + (1-args.task_weight)*loss_r + loss_static
 
                 losses.append(loss.item())

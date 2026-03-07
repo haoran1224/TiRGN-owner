@@ -1,6 +1,4 @@
-torch==1.6.0
-torchvision==0.7.0
-dgl-cu102==0.5.2
+dgl==0.9.1
 tqdm
 pandas
 rdflib
