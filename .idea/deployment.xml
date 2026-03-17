@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" remoteFilesAllowedToDisappearOnAutoupload="false">
+  <component name="PublishConfigData" serverName="实验室服务器" remoteFilesAllowedToDisappearOnAutoupload="false">
     <serverData>
-      <paths name="lhr@125.223.116.139:10000 password">
+      <paths name="实验室服务器">
         <serverdata>
           <mappings>
-            <mapping deploy="/TiRGN-main" local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/home/lhr/PythonProject/TiRGN-main" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>

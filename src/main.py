@@ -90,9 +90,30 @@ def align_paths_to_snapshots(data_list, all_paths):
     return aligned
 
 
+def align_tensor_to_snapshots(data_list, tensor):
+    """
+    按 snapshot 长度将平铺的 Tensor 切割对齐
+
+    Args:
+        data_list: snapshot 列表，每个元素是一个 snapshot
+        tensor: 完整的张量，形状为 [total_queries, ...]
+
+    Returns:
+        aligned: 对齐后的张量列表，每个元素是对应 snapshot 的张量切片
+    """
+    aligned = []
+    ptr = 0
+    for snap in data_list:
+        length = len(snap)
+        # 在第 0 维（Batch 维）进行切片
+        aligned.append(tensor[ptr: ptr + length])
+        ptr += length
+    return aligned
+
+
 # =================================================================
 
-def test(model, history_list, test_list, num_rels, num_nodes, use_cuda, all_ans_list, all_ans_r_list, model_name, static_graph, time_list, history_time_nogt, mode, test_snapshot_paths):
+def test(model, history_list, test_list, num_rels, num_nodes, use_cuda, all_ans_list, all_ans_r_list, model_name, static_graph, time_list, history_time_nogt, mode, test_fwd_snapshot_paths, test_fwd_snapshot_lens, test_inv_snapshot_paths, test_inv_snapshot_lens):
     ranks_raw, ranks_filter, mrr_raw_list, mrr_filter_list = [], [], [], []
     ranks_raw_r, ranks_filter_r, mrr_raw_list_r, mrr_filter_list_r = [], [], [], []
 
@@ -153,13 +174,14 @@ def test(model, history_list, test_list, num_rels, num_nodes, use_cuda, all_ans_
             one_hot_tail_seq = one_hot_tail_seq.cuda()
             one_hot_rel_seq = one_hot_rel_seq.cuda()
 
-        # ==================== SRM-LLM ADD ====================
-        current_batch_paths = test_snapshot_paths[time_idx]
-        global_graph = build_global_graph_from_paths(
-            current_batch_paths, num_nodes, num_rels, add_inverse=True, use_cuda=use_cuda)
-        # =====================================================
+        # ==================== SRM-LLM ADD (离线预处理版本) ====================
+        # 取出当前 batch 的对齐后路径张量（正向+逆向）
+        current_fwd_paths = test_fwd_snapshot_paths[time_idx]
+        current_fwd_lens = test_fwd_snapshot_lens[time_idx]
+        current_inv_paths = test_inv_snapshot_paths[time_idx]
+        current_inv_lens = test_inv_snapshot_lens[time_idx]
 
-        test_triples, final_score, final_r_score = model.predict(history_glist, num_rels, static_graph, test_triples_input, one_hot_tail_seq, one_hot_rel_seq, global_graph, current_batch_paths, use_cuda)
+        test_triples, final_score, final_r_score = model.predict(history_glist, num_rels, static_graph, test_triples_input, one_hot_tail_seq, one_hot_rel_seq, current_fwd_paths, current_fwd_lens, current_inv_paths, current_inv_lens, use_cuda)
 
         mrr_filter_snap_r, mrr_snap_r, rank_raw_r, rank_filter_r = utils.get_total_rank(test_triples, final_r_score, all_ans_r_list[time_idx], eval_bz=1000, rel_predict=1)
         mrr_filter_snap, mrr_snap, rank_raw, rank_filter = utils.get_total_rank(test_triples, final_score, all_ans_list[time_idx], eval_bz=1000, rel_predict=0)
@@ -248,21 +270,44 @@ def run_experiment(args, history_len=None, n_layers=None, dropout=None, n_bases=
     all_ans_list_valid = utils.load_all_answers_for_time_filter(data.valid, num_rels, num_nodes, False)
     all_ans_list_r_valid = utils.load_all_answers_for_time_filter(data.valid, num_rels, num_nodes, True)
 
-    # ==================== SRM-LLM ADD ====================
-    print("loading TLogic history paths...")
-    # 请确保路径文件放在 data/对应数据集/ 下，或根据你的实际存放位置修改路径
-    with open(f'../data/{args.dataset}/train_paths_top50.pkl', 'rb') as f:
-        all_train_paths = pickle.load(f)
-    with open(f'../data/{args.dataset}/valid_paths_top50.pkl', 'rb') as f:
-        all_valid_paths = pickle.load(f)
-    with open(f'../data/{args.dataset}/test_paths_top50.pkl', 'rb') as f:
-        all_test_paths = pickle.load(f)
+    # ==================== SRM-LLM ADD (离线预处理版本) ====================
+    print("loading preprocessed TLogic path tensors...")
+    # 读取预处理的张量文件（存放在 CPU）
+    data_path = f'../data/{args.dataset}'
 
-    # 对齐数据：将平铺列表按 snapshot 长度切片
-    train_snapshot_paths = align_paths_to_snapshots(train_list, all_train_paths)
-    valid_snapshot_paths = align_paths_to_snapshots(valid_list, all_valid_paths)
-    test_snapshot_paths = align_paths_to_snapshots(test_list, all_test_paths)
-    print("TLogic history paths loaded and aligned to snapshots.")
+    # 正向路径张量和长度
+    train_fwd_paths = torch.load(os.path.join(data_path, 'train_fwd_paths.pt'), map_location='cpu')
+    train_fwd_lens = torch.load(os.path.join(data_path, 'train_fwd_lens.pt'), map_location='cpu')
+    valid_fwd_paths = torch.load(os.path.join(data_path, 'valid_fwd_paths.pt'), map_location='cpu')
+    valid_fwd_lens = torch.load(os.path.join(data_path, 'valid_fwd_lens.pt'), map_location='cpu')
+    test_fwd_paths = torch.load(os.path.join(data_path, 'test_fwd_paths.pt'), map_location='cpu')
+    test_fwd_lens = torch.load(os.path.join(data_path, 'test_fwd_lens.pt'), map_location='cpu')
+
+    # 逆向路径张量和长度
+    train_inv_paths = torch.load(os.path.join(data_path, 'train_inv_paths.pt'), map_location='cpu')
+    train_inv_lens = torch.load(os.path.join(data_path, 'train_inv_lens.pt'), map_location='cpu')
+    valid_inv_paths = torch.load(os.path.join(data_path, 'valid_inv_paths.pt'), map_location='cpu')
+    valid_inv_lens = torch.load(os.path.join(data_path, 'valid_inv_lens.pt'), map_location='cpu')
+    test_inv_paths = torch.load(os.path.join(data_path, 'test_inv_paths.pt'), map_location='cpu')
+    test_inv_lens = torch.load(os.path.join(data_path, 'test_inv_lens.pt'), map_location='cpu')
+
+    # 对齐数据：将平铺张量按 snapshot 长度切片
+    train_fwd_snapshot_paths = align_tensor_to_snapshots(train_list, train_fwd_paths)
+    train_fwd_snapshot_lens = align_tensor_to_snapshots(train_list, train_fwd_lens)
+    train_inv_snapshot_paths = align_tensor_to_snapshots(train_list, train_inv_paths)
+    train_inv_snapshot_lens = align_tensor_to_snapshots(train_list, train_inv_lens)
+
+    valid_fwd_snapshot_paths = align_tensor_to_snapshots(valid_list, valid_fwd_paths)
+    valid_fwd_snapshot_lens = align_tensor_to_snapshots(valid_list, valid_fwd_lens)
+    valid_inv_snapshot_paths = align_tensor_to_snapshots(valid_list, valid_inv_paths)
+    valid_inv_snapshot_lens = align_tensor_to_snapshots(valid_list, valid_inv_lens)
+
+    test_fwd_snapshot_paths = align_tensor_to_snapshots(test_list, test_fwd_paths)
+    test_fwd_snapshot_lens = align_tensor_to_snapshots(test_list, test_fwd_lens)
+    test_inv_snapshot_paths = align_tensor_to_snapshots(test_list, test_inv_paths)
+    test_inv_snapshot_lens = align_tensor_to_snapshots(test_list, test_inv_lens)
+
+    print("Preprocessed path tensors loaded and aligned to snapshots.")
     # =====================================================
 
     model_name = "gl_rate_{}-{}-{}-{}-ly{}-dilate{}-his{}-weight_{}-discount_{}-angle_{}-dp{}_{}_{}_{}-gpu{}-{}"\
@@ -331,19 +376,19 @@ def run_experiment(args, history_len=None, n_layers=None, dropout=None, n_bases=
 
     if args.test and os.path.exists(model_state_file):
         mrr_raw, mrr_filter, mrr_raw_r, mrr_filter_r, hit_result_raw, hit_result_filter, hit_result_raw_r, hit_result_filter_r = test(model,
-                                                            train_list+valid_list, 
-                                                            test_list, 
-                                                            num_rels, 
-                                                            num_nodes, 
-                                                            use_cuda, 
-                                                            all_ans_list_test, 
-                                                            all_ans_list_r_test, 
-                                                            model_state_file, 
+                                                            train_list+valid_list,
+                                                            test_list,
+                                                            num_rels,
+                                                            num_nodes,
+                                                            use_cuda,
+                                                            all_ans_list_test,
+                                                            all_ans_list_r_test,
+                                                            model_state_file,
                                                             static_graph,
                                                             test_times,
                                                             history_test_time_nogt,
                                                             "test",
-                                                            test_snapshot_paths)
+                                                            test_fwd_snapshot_paths, test_fwd_snapshot_lens, test_inv_snapshot_paths, test_inv_snapshot_lens)
     elif args.test and not os.path.exists(model_state_file):
         print("--------------{} not exist, Change mode to train and generate stat for testing----------------\n".format(model_state_file))
     else:
@@ -393,14 +438,14 @@ def run_experiment(args, history_len=None, n_layers=None, dropout=None, n_bases=
                     one_hot_tail_seq = one_hot_tail_seq.cuda()
                     one_hot_rel_seq = one_hot_rel_seq.cuda()
 
-                # ==================== SRM-LLM ADD ====================
-                # 取出当前 batch 的对齐后路径并构图
-                current_batch_paths = train_snapshot_paths[train_sample_num]
-                global_graph = build_global_graph_from_paths(
-                    current_batch_paths, num_nodes, num_rels, add_inverse=True, use_cuda=use_cuda)
-                # =====================================================
+                # ==================== SRM-LLM ADD (离线预处理版本) ====================
+                # 取出当前 batch 的对齐后路径张量（正向+逆向）
+                current_fwd_paths = train_fwd_snapshot_paths[train_sample_num]
+                current_fwd_lens = train_fwd_snapshot_lens[train_sample_num]
+                current_inv_paths = train_inv_snapshot_paths[train_sample_num]
+                current_inv_lens = train_inv_snapshot_lens[train_sample_num]
 
-                loss_e, loss_r, loss_static = model.get_loss(history_glist, output[0], static_graph, one_hot_tail_seq, one_hot_rel_seq, global_graph, current_batch_paths, use_cuda)
+                loss_e, loss_r, loss_static = model.get_loss(history_glist, output[0], static_graph, one_hot_tail_seq, one_hot_rel_seq, current_fwd_paths, current_fwd_lens, current_inv_paths, current_inv_lens, use_cuda)
                 loss = args.task_weight*loss_e + (1-args.task_weight)*loss_r + loss_static
 
                 losses.append(loss.item())
@@ -419,19 +464,19 @@ def run_experiment(args, history_len=None, n_layers=None, dropout=None, n_bases=
             # validation
             if epoch and epoch % args.evaluate_every == 0:
                 mrr_raw, mrr_filter, mrr_raw_r, mrr_filter_r, hit_result_raw, hit_result_filter, hit_result_raw_r, hit_result_filter_r = test(model,
-                                                                    train_list, 
-                                                                    valid_list, 
-                                                                    num_rels, 
-                                                                    num_nodes, 
-                                                                    use_cuda, 
-                                                                    all_ans_list_valid, 
-                                                                    all_ans_list_r_valid, 
-                                                                    model_state_file, 
+                                                                    train_list,
+                                                                    valid_list,
+                                                                    num_rels,
+                                                                    num_nodes,
+                                                                    use_cuda,
+                                                                    all_ans_list_valid,
+                                                                    all_ans_list_r_valid,
+                                                                    model_state_file,
                                                                     static_graph,
                                                                     valid_times,
                                                                     history_val_time_nogt,
                                                                     mode="train",
-                                                                    test_snapshot_paths=valid_snapshot_paths)
+                                                                    test_fwd_snapshot_paths=valid_fwd_snapshot_paths, test_fwd_snapshot_lens=valid_fwd_snapshot_lens, test_inv_snapshot_paths=valid_inv_snapshot_paths, test_inv_snapshot_lens=valid_inv_snapshot_lens)
                 
                 if not args.relation_evaluation:  # entity prediction evalution
                     if mrr_raw < best_mrr:
@@ -449,18 +494,18 @@ def run_experiment(args, history_len=None, n_layers=None, dropout=None, n_bases=
                         torch.save({'state_dict': model.state_dict(), 'epoch': epoch}, model_state_file)
         mrr_raw, mrr_filter, mrr_raw_r, mrr_filter_r, hit_result_raw, hit_result_filter, hit_result_raw_r, hit_result_filter_r = test(model,
                                                             train_list+valid_list,
-                                                            test_list, 
-                                                            num_rels, 
-                                                            num_nodes, 
-                                                            use_cuda, 
-                                                            all_ans_list_test, 
-                                                            all_ans_list_r_test, 
-                                                            model_state_file, 
+                                                            test_list,
+                                                            num_rels,
+                                                            num_nodes,
+                                                            use_cuda,
+                                                            all_ans_list_test,
+                                                            all_ans_list_r_test,
+                                                            model_state_file,
                                                             static_graph,
                                                             test_times,
                                                             history_test_time_nogt,
                                                             mode="test",
-                                                            test_snapshot_paths=test_snapshot_paths)
+                                                            test_fwd_snapshot_paths=test_fwd_snapshot_paths, test_fwd_snapshot_lens=test_fwd_snapshot_lens, test_inv_snapshot_paths=test_inv_snapshot_paths, test_inv_snapshot_lens=test_inv_snapshot_lens)
     return mrr_raw, mrr_filter, mrr_raw_r, mrr_filter_r, hit_result_raw, hit_result_filter, hit_result_raw_r, hit_result_filter_r
 
 
