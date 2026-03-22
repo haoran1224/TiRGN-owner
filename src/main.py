@@ -170,7 +170,15 @@ def test(model, history_list, test_list, num_rels, num_nodes, use_cuda, all_ans_
             rel_seq_idx = histroy_data[:, 0] * num_nodes + histroy_data[:, 2]
             rel_seq = torch.Tensor(all_rel_seq[rel_seq_idx].todense())
             one_hot_rel_seq = rel_seq.masked_fill(rel_seq != 0, 1)
+            # ======== 新增：加载 1-hop 局部历史数据 ========
+            all_tail_local_seq = sp.load_npz(
+                '../data/{}/history_1hop_10/tail_history_{}.npz'.format(args.dataset, time_list[time_idx]))
+            seq_local_idx = histroy_data[:, 0]  # 注意一跳邻居只用头实体ID作为索引
+            tail_local_seq = torch.Tensor(all_tail_local_seq[seq_local_idx].todense())
+            one_hot_tail_local_seq = tail_local_seq.masked_fill(tail_local_seq != 0, 1)
+        # ===============================================
         if use_cuda:
+            one_hot_tail_local_seq = one_hot_tail_local_seq.cuda()
             one_hot_tail_seq = one_hot_tail_seq.cuda()
             one_hot_rel_seq = one_hot_rel_seq.cuda()
 
@@ -181,7 +189,7 @@ def test(model, history_list, test_list, num_rels, num_nodes, use_cuda, all_ans_
         current_inv_paths = test_inv_snapshot_paths[time_idx]
         current_inv_lens = test_inv_snapshot_lens[time_idx]
 
-        test_triples, final_score, final_r_score = model.predict(history_glist, num_rels, static_graph, test_triples_input, one_hot_tail_seq, one_hot_rel_seq, current_fwd_paths, current_fwd_lens, current_inv_paths, current_inv_lens, use_cuda)
+        test_triples, final_score, final_r_score = model.predict(history_glist, num_rels, static_graph, test_triples_input, one_hot_tail_seq, one_hot_rel_seq, one_hot_tail_local_seq, current_fwd_paths, current_fwd_lens, current_inv_paths, current_inv_lens, use_cuda)
 
         mrr_filter_snap_r, mrr_snap_r, rank_raw_r, rank_filter_r = utils.get_total_rank(test_triples, final_r_score, all_ans_r_list[time_idx], eval_bz=1000, rel_predict=1)
         mrr_filter_snap, mrr_snap, rank_raw, rank_filter = utils.get_total_rank(test_triples, final_score, all_ans_list[time_idx], eval_bz=1000, rel_predict=0)
@@ -434,7 +442,18 @@ def run_experiment(args, history_len=None, n_layers=None, dropout=None, n_bases=
                 rel_seq_idx = histroy_data[:, 0] * num_nodes + histroy_data[:, 2]
                 rel_seq = torch.Tensor(all_rel_seq[rel_seq_idx].todense())
                 one_hot_rel_seq = rel_seq.masked_fill(rel_seq != 0, 1)
+
+                # ======== 新增：加载 1-hop 局部历史数据 ========
+                all_tail_local_seq = sp.load_npz(
+                    '../data/{}/history_1hop_10/tail_history_{}.npz'.format(args.dataset,
+                                                                            train_times[train_sample_num]))
+                seq_local_idx = histroy_data[:, 0]
+                tail_local_seq = torch.Tensor(all_tail_local_seq[seq_local_idx].todense())
+                one_hot_tail_local_seq = tail_local_seq.masked_fill(tail_local_seq != 0, 1)
+                # ===============================================
+
                 if use_cuda:
+                    one_hot_tail_local_seq = one_hot_tail_local_seq.cuda()
                     one_hot_tail_seq = one_hot_tail_seq.cuda()
                     one_hot_rel_seq = one_hot_rel_seq.cuda()
 
@@ -445,7 +464,7 @@ def run_experiment(args, history_len=None, n_layers=None, dropout=None, n_bases=
                 current_inv_paths = train_inv_snapshot_paths[train_sample_num]
                 current_inv_lens = train_inv_snapshot_lens[train_sample_num]
 
-                loss_e, loss_r, loss_static = model.get_loss(history_glist, output[0], static_graph, one_hot_tail_seq, one_hot_rel_seq, current_fwd_paths, current_fwd_lens, current_inv_paths, current_inv_lens, use_cuda)
+                loss_e, loss_r, loss_static = model.get_loss(history_glist, output[0], static_graph, one_hot_tail_seq, one_hot_rel_seq, one_hot_tail_local_seq, current_fwd_paths, current_fwd_lens, current_inv_paths, current_inv_lens, use_cuda)
                 loss = args.task_weight*loss_e + (1-args.task_weight)*loss_r + loss_static
 
                 losses.append(loss.item())

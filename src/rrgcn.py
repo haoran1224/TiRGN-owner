@@ -172,6 +172,7 @@ class RecurrentRGCN(nn.Module):
             self.decoder_ob2 = TimeConvTransE(num_ents, h_dim, input_dropout, hidden_dropout, feat_dropout)
             self.rdecoder_re1 = TimeConvTransR(num_rels, h_dim, input_dropout, hidden_dropout, feat_dropout)
             self.rdecoder_re2 = TimeConvTransR(num_rels, h_dim, input_dropout, hidden_dropout, feat_dropout)
+            self.decoder_ob3 = TimeConvTransE(num_ents, h_dim, input_dropout, hidden_dropout,feat_dropout)  # <--【新增 1-hop 解码器】
         else:
             raise NotImplementedError
 
@@ -248,7 +249,7 @@ class RecurrentRGCN(nn.Module):
         return history_embs, static_emb, self.h_0, gate_list, degree_list
 
 
-    def predict(self, test_graph, num_rels, static_graph, test_triplets, entity_history_vocabulary, rel_history_vocabulary, fwd_paths_tensor, fwd_lens, inv_paths_tensor, inv_lens, use_cuda):
+    def predict(self, test_graph, num_rels, static_graph, test_triplets, entity_history_vocabulary, rel_history_vocabulary, entity_local_vocabulary, fwd_paths_tensor, fwd_lens, inv_paths_tensor, inv_lens, use_cuda):
         """
         预测函数，集成路径编码器和局部-全局融合模块（离线预处理版本）
 
@@ -308,13 +309,15 @@ class RecurrentRGCN(nn.Module):
                     print(f"路径编码失败，使用局部嵌入: {str(e)}")
                     embedding = local_emb
             # ===========================================================
-
+            start_embedding = F.normalize(evolve_embs[-1]) if self.layer_norm else evolve_embs[-1]
             time_embs = self.get_init_time(all_triples)
 
             score_rel_r = self.rel_raw_mode(embedding, r_emb, time_embs, all_triples)
             score_rel_h = self.rel_history_mode(embedding, r_emb, time_embs, all_triples, rel_history_vocabulary)
             score_r = self.raw_mode(embedding, r_emb, time_embs, all_triples)
-            score_h = self.history_mode(embedding, r_emb, time_embs, all_triples, entity_history_vocabulary)
+            score_h = self.history_mode(start_embedding, r_emb, time_embs, all_triples, entity_history_vocabulary)
+            # ======== 新增：计算局部 1-hop 历史打分 ========
+            score_l = self.history_local_mode(start_embedding, r_emb, time_embs, all_triples, entity_local_vocabulary) # p_local
 
             # 关键修复：添加数值稳定性保护
             # 添加小量 epsilon 防止 log(0) = nan
@@ -324,14 +327,14 @@ class RecurrentRGCN(nn.Module):
             score_rel = torch.clamp(score_rel, min=epsilon, max=1.0)
             score_rel = torch.log(score_rel)
 
-            score = self.history_rate * score_h + (1 - self.history_rate) * score_r
+            score = self.history_rate * score_h + (1 - self.history_rate -0.2) * score_r + 0.2 * score_l
             score = torch.clamp(score, min=epsilon, max=1.0)
             score = torch.log(score)
 
             return all_triples, score, score_rel
 
 
-    def get_loss(self, glist, triples, static_graph, entity_history_vocabulary, rel_history_vocabulary, fwd_paths_tensor, fwd_lens, inv_paths_tensor, inv_lens, use_cuda):
+    def get_loss(self, glist, triples, static_graph, entity_history_vocabulary, rel_history_vocabulary, entity_local_vocabulary, fwd_paths_tensor, fwd_lens, inv_paths_tensor, inv_lens, use_cuda):
         """
         计算损失函数，集成路径编码器和局部-全局融合模块（离线预处理版本）
 
@@ -396,6 +399,7 @@ class RecurrentRGCN(nn.Module):
                 pre_emb = local_emb
         # ===========================================================
 
+        start_emb = F.normalize(evolve_embs[-1]) if self.layer_norm else evolve_embs[-1]
         time_embs = self.get_init_time(all_triples)
 
         # 关键修复：添加数值稳定性保护
@@ -403,8 +407,10 @@ class RecurrentRGCN(nn.Module):
 
         if self.entity_prediction:
             score_r = self.raw_mode(pre_emb, r_emb, time_embs, all_triples)
-            score_h = self.history_mode(pre_emb, r_emb, time_embs, all_triples, entity_history_vocabulary)
-            score_en = self.history_rate * score_h + (1 - self.history_rate) * score_r
+            score_h = self.history_mode(start_emb, r_emb, time_embs, all_triples, entity_history_vocabulary)
+            # ======== 新增：计算局部 1-hop 历史打分 ========
+            score_l = self.history_local_mode(start_emb, r_emb, time_embs, all_triples, entity_local_vocabulary)
+            score_en = self.history_rate * score_h + (1 - self.history_rate-0.2) * score_r + 0.2 * score_l
             score_en = torch.clamp(score_en, min=epsilon, max=1.0)
             scores_en = torch.log(score_en)
             loss_ent += F.nll_loss(scores_en, all_triples[:, 2])
@@ -469,6 +475,17 @@ class RecurrentRGCN(nn.Module):
         score_global = self.decoder_ob2.forward(pre_emb, r_emb, time_embs, all_triples, partial_embeding = global_index)
         score_h = score_global
         score_h = F.softmax(score_h, dim=1)
+        return score_h
+
+    def history_local_mode(self, pre_emb, r_emb, time_embs, all_triples, history_vocabulary):
+        if self.use_cuda:
+            global_index = torch.Tensor(np.array(history_vocabulary.cpu(), dtype=float))
+            global_index = global_index.to('cuda')
+        else:
+            global_index = torch.Tensor(np.array(history_vocabulary.cpu(), dtype=float))
+        # 这里使用新增的 decoder_ob3
+        score_global = self.decoder_ob3.forward(pre_emb, r_emb, time_embs, all_triples, partial_embeding=global_index)
+        score_h = F.softmax(score_global, dim=1)
         return score_h
 
     def rel_raw_mode(self, pre_emb, r_emb, time_embs, all_triples):
